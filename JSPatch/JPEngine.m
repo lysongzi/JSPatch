@@ -15,6 +15,7 @@
 
 @implementation JPBoxing
 
+//宏定义装箱方法，类型包括id，指针，Class，弱引用对象，assign类型对象
 #define JPBOXING_GEN(_name, _prop, _type) \
 + (instancetype)_name:(_type)obj  \
 {   \
@@ -29,6 +30,8 @@ JPBOXING_GEN(boxClass, cls, Class)
 JPBOXING_GEN(boxWeakObj, weakObj, id)
 JPBOXING_GEN(boxAssignObj, assignObj, id)
 
+//解箱取出对象值
+//为何这里要区分对象类型和指针，Class类型？？？哦哦，注意到了，返回值类型不一样
 - (id)unbox
 {
     if (self.obj) return self.obj;
@@ -36,10 +39,12 @@ JPBOXING_GEN(boxAssignObj, assignObj, id)
     if (self.assignObj) return self.assignObj;
     return self;
 }
+//指针可能为空？空指针？
 - (void *)unboxPointer
 {
     return self.pointer;
 }
+
 - (Class)unboxClass
 {
     return self.cls;
@@ -54,6 +59,9 @@ JPBOXING_GEN(boxAssignObj, assignObj, id)
 typedef struct {double d;} JPDouble;
 typedef struct {float f;} JPFloat;
 
+//64位系统下，返回值为double/float类型
+//以返回结构体的方式返回值，double/float封装在结构体中
+//然后重新拼接方法签名字符串，设置到方法签名中
 static NSMethodSignature *fixSignature(NSMethodSignature *signature)
 {
 #if TARGET_OS_IPHONE
@@ -76,6 +84,7 @@ static NSMethodSignature *fixSignature(NSMethodSignature *signature)
     return signature;
 }
 
+//hook系统的获取方法签名的方法
 @interface NSObject (JPFix)
 - (NSMethodSignature *)jp_methodSignatureForSelector:(SEL)aSelector;
 + (void)jp_fixMethodSignature;
@@ -121,27 +130,28 @@ static NSString *_replaceStr = @".__c(\"$1\")(";
 static NSRegularExpression* _regex;
 static NSObject *_nullObj;
 static NSObject *_nilObj;
-static NSMutableDictionary *_registeredStruct;
-static NSMutableDictionary *_currInvokeSuperClsName;
-static char *kPropAssociatedObjectKey;
+static NSMutableDictionary *_registeredStruct;                      //注册的结构体列表
+static NSMutableDictionary *_currInvokeSuperClsName;                //当前调用的超类类型
+static char *kPropAssociatedObjectKey;                              //属性关联对象键值
 static BOOL _autoConvert;
 static BOOL _convertOCNumberToString;
-static NSString *_scriptRootDir;
-static NSMutableSet *_runnedScript;
+static NSString *_scriptRootDir;                                    //脚本根目录
+static NSMutableSet *_runnedScript;                                 //已经执行的脚本集合
 
 static NSMutableDictionary *_JSOverideMethods;
-static NSMutableDictionary *_TMPMemoryPool;
+static NSMutableDictionary *_TMPMemoryPool;                         //存储临时对象的内存池
 static NSMutableDictionary *_propKeys;
-static NSMutableDictionary *_JSMethodSignatureCache;
-static NSLock              *_JSMethodSignatureLock;
-static NSRecursiveLock     *_JSMethodForwardCallLock;
-static NSMutableDictionary *_protocolTypeEncodeDict;
-static NSMutableArray      *_pointersToRelease;
+static NSMutableDictionary *_JSMethodSignatureCache;                //方法签名缓存
+static NSLock              *_JSMethodSignatureLock;                 //方法签名锁，线程安全，替换为pthread？
+static NSRecursiveLock     *_JSMethodForwardCallLock;               //替换为pthread？
+static NSMutableDictionary *_protocolTypeEncodeDict;                //协议编码类型集合
+static NSMutableArray      *_pointersToRelease;                     //待释放的指针列表?
 
 #ifdef DEBUG
-static NSArray *_JSLastCallStack;
+static NSArray *_JSLastCallStack;                                   //JS调用栈？
 #endif
 
+//异常block
 static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
     NSCAssert(NO, log);
 };
@@ -158,35 +168,46 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
     
     JSContext *context = [[JSContext alloc] init];
     
+    //给js端注入诺干本地方法接口
 #ifdef DEBUG
+    //打印调试信息
     context[@"po"] = ^JSValue*(JSValue *obj) {
         id ocObject = formatJSToOC(obj);
         return [JSValue valueWithObject:[ocObject description] inContext:_context];
     };
 
+    //打印调用栈
     context[@"bt"] = ^JSValue*() {
         return [JSValue valueWithObject:_JSLastCallStack inContext:_context];
     };
 #endif
 
+    //类定义
     context[@"_OC_defineClass"] = ^(NSString *classDeclaration, JSValue *instanceMethods, JSValue *classMethods) {
         return defineClass(classDeclaration, instanceMethods, classMethods);
     };
 
+    //协议定义
     context[@"_OC_defineProtocol"] = ^(NSString *protocolDeclaration, JSValue *instProtocol, JSValue *clsProtocol) {
         return defineProtocol(protocolDeclaration, instProtocol,clsProtocol);
     };
     
+    //调用实例方法
     context[@"_OC_callI"] = ^id(JSValue *obj, NSString *selectorName, JSValue *arguments, BOOL isSuper) {
         return callSelector(nil, selectorName, arguments, obj, isSuper);
     };
+    
+    //调用类方法
     context[@"_OC_callC"] = ^id(NSString *className, NSString *selectorName, JSValue *arguments) {
         return callSelector(className, selectorName, arguments, nil, NO);
     };
+    
+    //转化JS对象为OC对象
     context[@"_OC_formatJSToOC"] = ^id(JSValue *obj) {
         return formatJSToOC(obj);
     };
     
+    //转化OC对象为JS对象
     context[@"_OC_formatOCToJS"] = ^id(JSValue *obj) {
         return formatOCToJS([obj toObject]);
     };
@@ -201,16 +222,19 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
         objc_setAssociatedObject(realObj, kPropAssociatedObjectKey, val, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     };
     
+    //设置一个弱引用对象？
     context[@"__weak"] = ^id(JSValue *jsval) {
         id obj = formatJSToOC(jsval);
         return [[JSContext currentContext][@"_formatOCToJS"] callWithArguments:@[formatOCToJS([JPBoxing boxWeakObj:obj])]];
     };
 
+    //设置一个强引用对象?
     context[@"__strong"] = ^id(JSValue *jsval) {
         id obj = formatJSToOC(jsval);
         return [[JSContext currentContext][@"_formatOCToJS"] callWithArguments:@[formatOCToJS(obj)]];
     };
     
+    //获取OC类的超类名
     context[@"_OC_superClsName"] = ^(NSString *clsName) {
         Class cls = NSClassFromString(clsName);
         return NSStringFromClass([cls superclass]);
@@ -224,33 +248,39 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
         _convertOCNumberToString = convertOCNumberToString;
     };
     
+    //引入js脚本文件？
     context[@"include"] = ^(NSString *filePath) {
         NSString *absolutePath = [_scriptRootDir stringByAppendingPathComponent:filePath];
         if (!_runnedScript) {
             _runnedScript = [[NSMutableSet alloc] init];
         }
+        //脚本文件绝对路径存在，且脚本文件未执行过，则执行该脚本文件
         if (absolutePath && ![_runnedScript containsObject:absolutePath]) {
             [JPEngine _evaluateScriptWithPath:absolutePath];
             [_runnedScript addObject:absolutePath];
         }
     };
     
+    //获取js脚本文件路径
     context[@"resourcePath"] = ^(NSString *filePath) {
         return [_scriptRootDir stringByAppendingPathComponent:filePath];
     };
 
+    //延迟执行一个js方法
     context[@"dispatch_after"] = ^(double time, JSValue *func) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(time * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [func callWithArguments:nil];
         });
     };
     
+    //在主队列执行异步任务
     context[@"dispatch_async_main"] = ^(JSValue *func) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [func callWithArguments:nil];
         });
     };
     
+    //在主队列执行同步任务，确保在主线程执行某个方法时候用？
     context[@"dispatch_sync_main"] = ^(JSValue *func) {
         if ([NSThread currentThread].isMainThread) {
             [func callWithArguments:nil];
@@ -261,12 +291,15 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
         }
     };
     
+    //在全局队列执行异步任务
     context[@"dispatch_async_global_queue"] = ^(JSValue *func) {
         dispatch_async(dispatch_get_global_queue(0, 0), ^{
             [func callWithArguments:nil];
         });
     };
     
+    //释放指针类型的临时对象
+    //临时内存池管理临时对象?
     context[@"releaseTmpObj"] = ^void(JSValue *jsVal) {
         if ([[jsVal toObject] isKindOfClass:[NSDictionary class]]) {
             void *pointer =  [(JPBoxing *)([jsVal toObject][@"__obj"]) unboxPointer];
@@ -289,11 +322,13 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
         _exceptionBlock([NSString stringWithFormat:@"js exception, \nmsg: %@, \nstack: \n %@", [msg toObject], [stack toObject]]);
     };
     
+    //配置context的异常处理handler
     context.exceptionHandler = ^(JSContext *con, JSValue *exception) {
         NSLog(@"%@", exception);
         _exceptionBlock([NSString stringWithFormat:@"js exception: %@", exception]);
     };
     
+    //空对象
     _nullObj = [[NSObject alloc] init];
     context[@"_OC_null"] = formatOCToJS(_nullObj);
     
@@ -309,11 +344,14 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleMemoryWarning) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
 #endif
     
+    //获取JSPatch.js脚本文件
     NSString *path = [[NSBundle bundleForClass:[self class]] pathForResource:@"JSPatch" ofType:@"js"];
     if (!path) _exceptionBlock(@"can't find JSPatch.js");
+    //加载JSPatch.js脚本文件内容
     NSString *jsCore = [[NSString alloc] initWithData:[[NSFileManager defaultManager] contentsAtPath:path] encoding:NSUTF8StringEncoding];
     
     if ([_context respondsToSelector:@selector(evaluateScript:withSourceURL:)]) {
+        //8.0以上支持
         [_context evaluateScript:jsCore withSourceURL:[NSURL URLWithString:@"JSPatch.js"]];
     } else {
         [_context evaluateScript:jsCore];
@@ -327,7 +365,7 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
 
 + (JSValue *)evaluateScriptWithPath:(NSString *)filePath
 {
-    _scriptRootDir = [filePath stringByDeletingLastPathComponent];
+    _scriptRootDir = [filePath stringByDeletingLastPathComponent]; //这步是？？?
     return [self _evaluateScriptWithPath:filePath];
 }
 
@@ -337,17 +375,20 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
     return [self _evaluateScript:script withSourceURL:[NSURL URLWithString:[filePath lastPathComponent]]];
 }
 
+//实际执行脚本的方法
 + (JSValue *)_evaluateScript:(NSString *)script withSourceURL:(NSURL *)resourceURL
 {
     if (!script || ![JSContext class]) {
         _exceptionBlock(@"script is nil");
         return nil;
     }
+    //启动引擎，如果已启动该方法会直接返回
     [self startEngine];
     
     if (!_regex) {
         _regex = [NSRegularExpression regularExpressionWithPattern:_regexStr options:0 error:nil];
     }
+    //执行js脚本的代码模板，捕捉异常信息，调用本地方法打印
     NSString *formatedScript = [NSString stringWithFormat:@";(function(){try{\n%@\n}catch(e){_OC_catch(e.message, e.stack)}})();", [_regex stringByReplacingMatchesInString:script options:0 range:NSMakeRange(0, script.length) withTemplate:_replaceStr]];
     @try {
         if ([_context respondsToSelector:@selector(evaluateScript:withSourceURL:)]) {
